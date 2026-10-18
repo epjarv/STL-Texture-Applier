@@ -253,6 +253,111 @@ def _smoothstep(edge0: float, edge1: float, value: np.ndarray) -> np.ndarray:
     return t * t * (3.0 - 2.0 * t)
 
 
+def _span_arc(xy: np.ndarray) -> tuple[np.ndarray, float]:
+    """Distance along a wall that is a single flat sheet in top view."""
+    center = (xy.min(axis=0) + xy.max(axis=0)) * 0.5
+    rel = xy - center
+    _, axes = np.linalg.eigh(rel.T @ rel)
+    dist = rel @ axes[:, -1]
+    arc = dist - float(dist.min())
+    length = max(float(arc.max()), 1e-6)
+    return arc, length
+
+
+def _monotone_hull(pts: np.ndarray) -> np.ndarray:
+    """Convex outline, counterclockwise, without extra points along a straight wall."""
+    pts = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+    def chain(points: np.ndarray) -> list[np.ndarray]:
+        hull: list[np.ndarray] = []
+        for point in points:
+            while len(hull) >= 2:
+                a, b = hull[-2], hull[-1]
+                turn = (b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0])
+                if turn > 1e-9:
+                    break
+                hull.pop()
+            hull.append(point)
+        return hull
+
+    lower = chain(pts)
+    upper = chain(pts[::-1])
+    ring = lower[:-1] + upper[:-1]
+    if len(ring) < 3:
+        return np.zeros((0, 2))
+    return np.vstack(ring)
+
+
+def _convex_outline(xy: np.ndarray, extent: float) -> np.ndarray | None:
+    """Outer silhouette. A flat wall becomes one straight side."""
+    origin = xy.mean(axis=0)
+    rel = xy - origin
+    radius = np.hypot(rel[:, 0], rel[:, 1])
+    keep = radius > extent * 1e-8
+    if int(keep.sum()) < 3:
+        return None
+    rel = rel[keep]
+    radius = radius[keep]
+    bins = np.floor((np.arctan2(rel[:, 1], rel[:, 0]) + np.pi) / (2.0 * np.pi) * 1440.0).astype(np.int32)
+    bins = np.clip(bins, 0, 1439)
+    order = np.lexsort((radius, bins))
+    grouped = bins[order]
+    ends = np.concatenate((np.flatnonzero(np.diff(grouped)), [len(order) - 1]))
+    winners = xy[keep][order[ends]]
+    outline = _monotone_hull(winners)
+    if len(outline) < 3:
+        return None
+    area2 = float(np.sum(outline[:, 0] * np.roll(outline[:, 1], -1) - outline[:, 1] * np.roll(outline[:, 0], -1)))
+    if area2 < 0.0:
+        outline = outline[::-1]
+    if abs(area2) < (extent * extent) * 1e-8:
+        return None
+    return outline
+
+
+def _outline_arc(xy: np.ndarray) -> tuple[np.ndarray, float]:
+    """Distance along the top-down outline of the part.
+
+    A wide flat wall is one straight side of that outline, so the pattern keeps
+    a constant spacing from edge to edge. Measuring by angle around the middle
+    packs the pattern into a vertical band at the center of the wall.
+    """
+    xy = np.asarray(xy, dtype=np.float64)
+    if len(xy) == 0:
+        return np.zeros(0, dtype=np.float64), 1.0
+    extent = float(np.max(np.ptp(xy, axis=0)))
+    if extent < 1e-9 or float(np.min(np.ptp(xy, axis=0))) < extent * 1e-6:
+        return _span_arc(xy)
+
+    outline = _convex_outline(xy, extent)
+    if outline is None:
+        return _span_arc(xy)
+
+    origin = outline.mean(axis=0)
+    local = outline - origin
+    angles = np.unwrap(np.arctan2(local[:, 1], local[:, 0]))
+    if float(angles[-1] - angles[0]) < np.pi or np.any(np.diff(angles) < -1e-8):
+        return _span_arc(xy)
+
+    edge = np.roll(local, -1, axis=0) - local
+    edge_len = np.linalg.norm(edge, axis=1)
+    perimeter = float(edge_len.sum())
+    if perimeter < 1e-8:
+        return _span_arc(xy)
+    cumulative = np.concatenate((np.zeros(1), np.cumsum(edge_len[:-1])))
+
+    rel = xy - origin
+    query = np.arctan2(rel[:, 1], rel[:, 0])
+    query = np.where(query < angles[0], query + 2.0 * np.pi, query)
+    side = np.clip(np.searchsorted(angles, query, side="right") - 1, 0, len(outline) - 1)
+    start = local[side]
+    direction = edge[side]
+    den = rel[:, 0] * direction[:, 1] - rel[:, 1] * direction[:, 0]
+    num = start[:, 0] * rel[:, 1] - start[:, 1] * rel[:, 0]
+    along = np.divide(num, den, out=np.zeros(len(xy)), where=np.abs(den) > 1e-12)
+    along = np.clip(along, 0.0, 1.0)
+    return cumulative[side] + along * edge_len[side], perimeter
+
+
 def _wrap_part(
     points: np.ndarray,
     normals: np.ndarray,
@@ -264,18 +369,17 @@ def _wrap_part(
     ox: float,
     oy: float,
 ) -> np.ndarray:
-    """Planar on decks and floors, continuous wrap around walls and curves.
+    """Planar on decks and floors, even wrap around walls and curves.
 
-    The wrap uses one angular coordinate, so the pattern keeps the same spacing
-    as it turns the stern instead of smearing two flat projections together.
-    An integer number of repeats makes the seam meet.
+    Walls are measured along the outline of the part, so a tall flat face keeps
+    the same spacing in the middle that it has at the edges. An integer number
+    of repeats makes the seam meet at a corner.
     """
     midpoint = (points.min(axis=0) + points.max(axis=0)) * 0.5
     rel = points - midpoint
-    radius = np.hypot(rel[:, 0], rel[:, 1])
-    radius_ref = max(float(np.percentile(radius, 98)), 1e-6)
-    repeats_around = max(1, int(round(2.0 * np.pi * radius_ref * per_unit)))
-    around = np.arctan2(rel[:, 1], rel[:, 0]) / (2.0 * np.pi) * repeats_around
+    arc, perimeter = _outline_arc(points[:, :2])
+    repeats_around = max(1, int(round(max(perimeter, 1e-6) * per_unit)))
+    around = arc / perimeter * repeats_around
     height = rel[:, 2] * per_unit
     u_side, v_side = _rotate(around, height, angle)
     h_side = _sample(image, u_side + ox, v_side + oy)

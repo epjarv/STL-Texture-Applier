@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QSplitter,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -64,6 +65,68 @@ def _pixmap(rgb: np.ndarray) -> QPixmap:
     height, width, _ = rgb.shape
     image = QImage(rgb.data, width, height, width * 3, QImage.Format.Format_RGB888).copy()
     return QPixmap.fromImage(image)
+
+
+class _FitLabel(QLabel):
+    """Word-wrapped label that follows the column instead of widening it."""
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self.setWordWrap(True)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        if width < 1:
+            return self.fontMetrics().lineSpacing()
+        flags = int(Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap)
+        rect = self.fontMetrics().boundingRect(0, 0, width, 10000, flags, self.text())
+        return max(rect.height(), self.fontMetrics().lineSpacing())
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        metrics = self.fontMetrics()
+        natural = metrics.horizontalAdvance(self.text()) + 2
+        # Paragraphs wrap inside the column. A hint wider than the fixed
+        # controls would make the scroll body look larger than the panel.
+        width = min(natural, 220) if natural > 0 else metrics.lineSpacing()
+        return QSize(max(width, 1), self.heightForWidth(max(width, 1)))
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return QSize(0, self.fontMetrics().lineSpacing())
+
+
+class _ElideLabel(QLabel):
+    """Single-line title that shrinks by eliding instead of widening the column."""
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._full = ""
+        self.setMinimumWidth(64)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        self._full = text
+        self._apply()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._apply()
+
+    def _apply(self) -> None:
+        width = self.width() if self.width() > 8 else 160
+        elided = self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideMiddle, width)
+        if self.text() != elided:
+            QLabel.setText(self, elided)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        height = max(super().sizeHint().height(), self.fontMetrics().lineSpacing())
+        width = min(self.fontMetrics().horizontalAdvance(self._full) + 4, 160)
+        return QSize(max(width, 64), height)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return QSize(64, self.fontMetrics().lineSpacing())
 
 
 class _CarveWorker(QThread):
@@ -151,6 +214,7 @@ class MainWindow(QMainWindow):
         self.worker: _CarveWorker | None = None
         self.pending = False
         self._guard = False
+        self._split_applied = False
 
         self._build()
         self._build_menu()
@@ -162,17 +226,19 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         outer = QHBoxLayout(root)
         outer.setContentsMargins(16, 12, 16, 16)
-        outer.setSpacing(14)
+        outer.setSpacing(0)
 
         panel = QFrame()
         panel.setObjectName("panel")
-        panel.setFixedWidth(372)
+        panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._panel = panel
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(16, 16, 16, 14)
         panel_layout.setSpacing(10)
 
         title = QLabel("STL Texture Applier")
         title.setObjectName("title")
+        self._title = title
         subtitle = QLabel("Carve a texture into an STL.")
         subtitle.setObjectName("subtitle")
         panel_layout.addWidget(title)
@@ -181,17 +247,23 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         body = QWidget()
+        body.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         form = QVBoxLayout(body)
-        form.setContentsMargins(0, 8, 4, 8)
+        form.setContentsMargins(0, 8, 8, 8)
         form.setSpacing(8)
         scroll.setWidget(body)
+        self._scroll = scroll
+        self._body = body
+        self._form = form
         panel_layout.addWidget(scroll, 1)
 
         form.addWidget(self._section("Model"))
-        self.model_name = QLabel("Sample cube")
-        self.model_meta = QLabel("")
+        self.model_name = _FitLabel("Sample cube")
+        self.model_meta = _FitLabel("")
         self.model_meta.setObjectName("muted")
         form.addWidget(self.model_name)
         form.addWidget(self.model_meta)
@@ -212,6 +284,8 @@ class MainWindow(QMainWindow):
         grid = QGridLayout()
         grid.setSpacing(8)
         self.pattern_buttons: dict[int, QToolButton] = {}
+        for column in range(3):
+            grid.setColumnStretch(column, 1)
         for index, (name, tip, _fn) in enumerate(BUILT_IN):
             button = self._pattern_button(name, tip, swatch(self.patterns[name]))
             self.pattern_group.addButton(button, index)
@@ -240,7 +314,7 @@ class MainWindow(QMainWindow):
         self.detail_slider, self.detail_value = self._plain_slider(
             form, "Detail", 0, 1000, self._on_detail_slider
         )
-        self.detail_caption = QLabel("")
+        self.detail_caption = _FitLabel("")
         self.detail_caption.setObjectName("muted")
         form.addWidget(self.detail_caption)
 
@@ -264,13 +338,13 @@ class MainWindow(QMainWindow):
         self.centered.toggled.connect(self._on_option)
         form.addWidget(self.invert)
         form.addWidget(self.centered)
-        self.hint = QLabel("")
+        self.hint = _FitLabel("")
         self.hint.setObjectName("hint")
-        self.hint.setWordWrap(True)
         form.addWidget(self.hint)
-        note = QLabel("The finish is carved into the surface and stays in the STL. The underside is left smooth so the part sits flat on the bed.")
+        note = _FitLabel(
+            "The finish is carved into the surface and stays in the STL. The underside is left smooth so the part sits flat on the bed."
+        )
         note.setObjectName("hint")
-        note.setWordWrap(True)
         form.addWidget(note)
         form.addStretch(1)
 
@@ -279,19 +353,24 @@ class MainWindow(QMainWindow):
         self.output_button.setEnabled(False)
         self.output_button.clicked.connect(self._export)
         panel_layout.addWidget(self.output_button)
-        self.status = QLabel("Opening a sample cube.")
+        self.status = _FitLabel("Opening a sample cube.")
         self.status.setObjectName("status")
-        self.status.setWordWrap(True)
         panel_layout.addWidget(self.status)
-        outer.addWidget(panel)
 
-        stage = QVBoxLayout()
+        stage_host = QWidget()
+        stage_host.setObjectName("stage")
+        stage_host.setMinimumWidth(220)
+        stage_host.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._stage = stage_host
+        stage = QVBoxLayout(stage_host)
+        stage.setContentsMargins(0, 0, 0, 0)
         stage.setSpacing(8)
         toolbar = QHBoxLayout()
-        self.view_title = QLabel("Sample cube")
+        toolbar.setSpacing(8)
+        self._toolbar = toolbar
+        self.view_title = _ElideLabel("Sample cube")
         self.view_title.setObjectName("title")
-        toolbar.addWidget(self.view_title)
-        toolbar.addStretch(1)
+        toolbar.addWidget(self.view_title, 1)
         self.frame_button = QPushButton("Frame")
         self.frame_button.setObjectName("ghost")
         self.frame_button.clicked.connect(self._frame)
@@ -311,6 +390,8 @@ class MainWindow(QMainWindow):
 
         frame = QFrame()
         frame.setObjectName("viewportFrame")
+        frame.setMinimumWidth(0)
+        frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         frame_layout = QVBoxLayout(frame)
         frame_layout.setContentsMargins(1, 1, 1, 1)
         self.viewport = FinishViewport(frame)
@@ -323,7 +404,21 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.progress.setFixedHeight(3)
         stage.addWidget(self.progress)
-        outer.addLayout(stage, 1)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setObjectName("split")
+        splitter.setChildrenCollapsible(False)
+        splitter.setOpaqueResize(True)
+        splitter.setHandleWidth(14)
+        splitter.addWidget(panel)
+        splitter.addWidget(stage_host)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        self._splitter = splitter
+        outer.addWidget(splitter)
+        QTimer.singleShot(0, self._finish_layout)
 
         self._set_scale(2.5)
         self._set_detail(0.55)
@@ -387,8 +482,9 @@ class MainWindow(QMainWindow):
         slider.valueChanged.connect(on_slider)
         spin = QDoubleSpinBox()
         spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
-        spin.setFixedWidth(78)
+        spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         spin.valueChanged[float].connect(on_spin)
+        self._fit_spin(spin)
         row.addWidget(slider, 1)
         row.addWidget(spin)
         form.addLayout(row)
@@ -460,6 +556,8 @@ class MainWindow(QMainWindow):
         self._guard = False
         if reset:
             self._set_depth(min(DEFAULT_DEPTH, depth_max))
+        self._fit_spin(self.depth_spin)
+        self._lock_panel_minimum()
 
     def _set_depth(self, depth: float) -> None:
         depth_max = max(self.depth_spin.maximum(), 1e-9)
@@ -892,6 +990,91 @@ class MainWindow(QMainWindow):
             if path:
                 self._take_path(path)
         event.acceptProposedAction()
+
+    def _fit_spin(self, spin: QDoubleSpinBox) -> None:
+        spin.ensurePolished()
+        width = max(spin.minimumSizeHint().width(), spin.sizeHint().width())
+        if width > 0:
+            spin.setFixedWidth(width)
+
+    def _lock_panel_minimum(self) -> None:
+        if not hasattr(self, "_panel"):
+            return
+        self._panel.ensurePolished()
+        self._body.ensurePolished()
+        margins = self._form.contentsMargins()
+        content = self._body.minimumSizeHint().width()
+        content = max(
+            content,
+            self.centered.sizeHint().width() + margins.left() + margins.right(),
+            self.invert.sizeHint().width() + margins.left() + margins.right(),
+            self._title.sizeHint().width() + margins.left() + margins.right(),
+        )
+        for spin in (
+            self.depth_spin,
+            self.scale_spin,
+            self.contrast_spin,
+            self.angle_spin,
+            self.shift_x_spin,
+            self.shift_y_spin,
+        ):
+            # Keep a usable groove beside the numeric field.
+            row = spin.width() + 96 + 8
+            content = max(content, row + margins.left() + margins.right())
+        panel_margins = self._panel.layout().contentsMargins()
+        # Border, vertical scrollbar, and a few pixels so glyphs clear the edge.
+        chrome = panel_margins.left() + panel_margins.right() + 2 + 12 + 12
+        floor = content + chrome
+        if floor > self._panel.minimumWidth():
+            self._panel.setMinimumWidth(floor)
+        splitter = getattr(self, "_splitter", None)
+        if not self._split_applied or splitter is None or splitter.width() <= 0:
+            return
+        sizes = splitter.sizes()
+        if not sizes or sizes[0] + 1 >= self._panel.minimumWidth():
+            return
+        total = sum(sizes)
+        right_floor = max(self._stage.minimumWidth(), 1)
+        left = min(self._panel.minimumWidth(), max(1, total - right_floor))
+        splitter.setSizes([left, max(1, total - left)])
+
+    def _apply_initial_split(self) -> None:
+        if self._split_applied:
+            return
+        total = self._splitter.width()
+        if total < 200:
+            return
+        right_floor = max(self._stage.minimumWidth(), self.viewport.minimumWidth())
+        left = max(self._panel.minimumWidth(), int(total * 0.54))
+        left = min(left, total - right_floor)
+        left = max(left, min(self._panel.minimumWidth(), total - right_floor))
+        self._splitter.setSizes([left, max(1, total - left)])
+        self._split_applied = True
+
+    def _finish_layout(self) -> None:
+        for spin in (
+            self.depth_spin,
+            self.scale_spin,
+            self.contrast_spin,
+            self.angle_spin,
+            self.shift_x_spin,
+            self.shift_y_spin,
+        ):
+            self._fit_spin(spin)
+        for button in (self.frame_button, self.shaded_button, self.wire_button):
+            button.setMinimumWidth(button.sizeHint().width())
+        gaps = max(self._toolbar.count() - 1, 0) * self._toolbar.spacing()
+        toolbar_floor = self.view_title.minimumWidth() + sum(
+            button.minimumWidth() for button in (self.frame_button, self.shaded_button, self.wire_button)
+        )
+        self._stage.setMinimumWidth(max(toolbar_floor + gaps, self.viewport.minimumWidth()))
+        self._lock_panel_minimum()
+        self._apply_initial_split()
+        self._lock_panel_minimum()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self._finish_layout()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self.worker is not None and self.worker.isRunning():

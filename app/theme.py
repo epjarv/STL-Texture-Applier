@@ -22,6 +22,18 @@ QFrame#viewportFrame {
     border: 1px solid #2a2d32;
     border-radius: 14px;
 }
+QSplitter#split {
+    background: transparent;
+}
+QSplitter#split::handle:horizontal {
+    background: #121314;
+    width: 14px;
+    margin: 10px 0;
+    border-radius: 3px;
+}
+QSplitter#split::handle:horizontal:hover {
+    background: #3a3e44;
+}
 QLabel#title {
     font-size: 18px;
     font-weight: 600;

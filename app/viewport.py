@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 import pyvista as pv
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QSize, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtWidgets import QSizePolicy
 from pyvistaqt import QtInteractor
 
 
@@ -26,6 +27,8 @@ class FinishViewport(QtInteractor):
         self.enable_anti_aliasing("fxaa")
         self._actor = None
         self._framed = False
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self.setMinimumSize(QSize(180, 160))
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
         if event.mimeData().hasUrls():
